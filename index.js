@@ -3117,32 +3117,21 @@ async function init(router) {
                     }
                 }
 
-                if (!neighborEnabled) return hits;
-
-                const hitsBySource = new Map();
-                for (const hit of hits) {
-                    const src = hit._source_collection || "__default__";
-                    if (!hitsBySource.has(src)) hitsBySource.set(src, []);
-                    hitsBySource.get(src).push(hit);
-                }
-
-                const expanded = [];
-                for (const [src, srcHits] of hitsBySource) {
-                    const outline = await getOutline(src);
-                    if (!outline) {
-                        expanded.push(...srcHits);
-                        continue;
-                    }
-                    expanded.push(
-                        ...expandNeighbors(srcHits, outline, {
-                            back: neighborBack,
-                            forward: neighborForward,
-                            chapterCap,
-                        }),
-                    );
-                }
-
-                return expanded;
+                // 🟢 强制邻接扩展：只以「最佳命中」为锚，返回它的前后文窗口，
+                // 丢弃其他分散命中（避免把远距离章节的剧情一起召回）
+                if (hits.length === 0) return hits;
+                const anchor = hits[0];
+                const anchorSrc = anchor._source_collection || "__default__";
+                const anchorOutline = await getOutline(anchorSrc);
+                if (!anchorOutline) return [anchor];
+                console.log(
+                    `[Anima Neighbor] 🎯 最佳命中 ch${anchor.item?.metadata?.chapter_index}/ck${anchor.item?.metadata?.chunk_index}，仅保留 ±${neighborBack}/${neighborForward} 前后文`,
+                );
+                return expandNeighbors([anchor], anchorOutline, {
+                    back: neighborBack,
+                    forward: neighborForward,
+                    chapterCap,
+                });
             };
             tasks.push(kbTask());
 

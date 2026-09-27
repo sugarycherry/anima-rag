@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================
-# Anima RAG 一键更新脚本（Termux / Linux / macOS）
+# Anima 一键回退更新（Termux / Linux / macOS）
 #
 # 用法：
 #   bash update.sh                     # 自动定位 SillyTavern
 #   bash update.sh /路径/到/SillyTavern  # 手动指定
 #   ST_DIR=~/SillyTavern bash update.sh # 用环境变量指定
 #
-# 作用：
-#   · 后端插件 plugins/anima-rag  —— 切到你的 fork、拉取、npm install
-#   · 前端扩展 data/default-user/extensions/Anima-Memory-System —— 切到你的 fork、拉取
+# 行为（“回退”语义）：
+#   · 后端 plugins/anima-rag  —— 切到你的 fork → fetch → reset --hard origin/main（丢弃本地改动）
+#   · 前端 extensions/Anima-Memory-System —— 同上
+#   · 后端补依赖 npm install
 #   · 检查 config.yaml 的 enableServerPlugins
-#   · 不会动你的 vectors/ 与 settings.json（已被 .gitignore 忽略）
+#   · 不会动 vectors/ 与 settings.json（已 .gitignore）
+#
+# 说明：reset --hard 可处理“远端被强推/历史改写”的情况（普通 git pull 会失败）。
 # ============================================================
 
 set -u
@@ -39,40 +42,50 @@ ST="$(cd "$ST" && pwd)"
 info "SillyTavern 目录: $ST"
 
 command -v git >/dev/null 2>&1 || die "未安装 git（Termux: pkg install git）"
-command -v npm >/dev/null 2>&1 || die "未安装 node/npm（Termux: pkg install nodejs）"
 
+# 一键回退更新：切 fork → fetch → reset --hard origin/main
 sync_repo() { # $1=目录 $2=fork地址 $3=名称
-  local dir="$1" url="$2" name="$3"
+  local dir="$1" url="$2" name="$3" before after
   if [ -d "$dir/.git" ]; then
-    info "$name 已安装，切换到你的 fork 并更新…"
+    info "$name: 回退更新中（丢弃本地未提交改动）…"
     git -C "$dir" remote set-url origin "$url.git" 2>/dev/null || git -C "$dir" remote add origin "$url.git"
     git -C "$dir" fetch origin main || die "$name 拉取失败（检查网络）"
-    git -C "$dir" checkout -q -B main origin/main 2>/dev/null || git -C "$dir" reset --hard origin/main
-    ok "$name 已更新到 $(git -C "$dir" log --format='%h %s' -1)"
+    before="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo none)"
+    git -C "$dir" reset --hard origin/main || die "$name 回退失败"
+    after="$(git -C "$dir" log --format='%h %s' -1)"
+    if [ "$before" = "$(printf '%s' "$after" | cut -d' ' -f1)" ]; then
+      ok "$name: 已是最新 ($after)"
+    else
+      ok "$name: $before → $after"
+    fi
   elif [ -d "$dir" ]; then
-    info "$name 存在但不是 git 仓库，备份后重新克隆…"
+    info "$name: 不是 git 仓库，备份后重新克隆…"
     mv "$dir" "$dir.bak.$(date +%s)"
     git clone "$url.git" "$dir" || die "$name 克隆失败"
-    ok "$name 已重新克隆"
+    ok "$name: 已重新克隆"
     warn "旧目录已备份在 $dir.bak.*"
   else
-    info "$name 未安装，开始克隆…"
+    info "$name: 未安装，开始克隆…"
     mkdir -p "$(dirname "$dir")"
     git clone "$url.git" "$dir" || die "$name 克隆失败"
-    ok "$name 已安装"
+    ok "$name: 已安装"
   fi
 }
 
-# ---------- 2. 后端插件 ----------
+# ---------- 2. 后端 ----------
 PLUG="$ST/plugins/anima-rag"
-info "后端插件: $PLUG"
+info "后端: $PLUG"
 sync_repo "$PLUG" "$FORK_BACK" "后端 anima-rag"
 
-info "安装后端依赖（npm install，首次会稍慢）…"
-( cd "$PLUG" && npm install --no-audit --no-fund ) || die "npm install 失败"
-ok "后端依赖就绪"
+if command -v npm >/dev/null 2>&1; then
+  info "安装/校验后端依赖（npm install）…"
+  ( cd "$PLUG" && npm install --no-audit --no-fund ) || warn "npm install 失败（可稍后手动执行）"
+  ok "后端依赖就绪"
+else
+  warn "未安装 node/npm（Termux: pkg install nodejs），已跳过依赖安装"
+fi
 
-# ---------- 3. 检查插件开关 ----------
+# ---------- 3. 插件开关 ----------
 if grep -qE '^[[:space:]]*enableServerPlugins:[[:space:]]*true' "$ST/config.yaml"; then
   ok "config.yaml 已启用服务器插件"
 else
@@ -80,17 +93,15 @@ else
   printf '      sed -i "s/^enableServerPlugins:.*/enableServerPlugins: true/" "%s/config.yaml"\n' "$ST"
 fi
 
-# ---------- 4. 前端扩展 ----------
+# ---------- 4. 前端 ----------
 EXT="$ST/data/default-user/extensions/$FRONT_DIR_NAME"
-info "前端扩展: $EXT"
+info "前端: $EXT"
 sync_repo "$EXT" "$FORK_FRONT" "前端 $FRONT_DIR_NAME"
 
-# ---------- 5. 完成 ----------
+# ---------- 5. 收尾 ----------
 echo
-ok "全部完成！最后一步：重启 SillyTavern，然后刷新网页"
-echo "    · 先 Ctrl+C 停掉当前酒馆进程，再执行："
-echo "        cd \"$ST\" && node server.js"
-echo "    · 前端新控件位置：Anima 侧边栏 → 知识库"
-echo "        （邻接前后文 / 章节闸门 / 结果重排 / 切片模式 / 上下文检索）"
+ok "全部完成！最后两步："
+echo "    1) 重启酒馆：先 Ctrl+C 停掉，再执行：  cd \"$ST\" && node server.js"
+echo "    2) 手机浏览器：清除本站点缓存后重新打开 http://127.0.0.1:8000"
 echo "    · 你的 vectors/ 与 settings.json 不会被覆盖"
-echo "    · 更新完想回退：git -C \"$PLUG\" log --oneline  然后 git -C \"$PLUG\" checkout <旧提交>"
+echo "    · 想回退到某个旧提交： git -C \"$PLUG\" log --oneline  然后 git -C \"$PLUG\" checkout <提交号>"

@@ -3113,6 +3113,9 @@ async function init(router) {
                     animaSettings: anima,
                 });
 
+                // ⚠️ 扩窗用的 cap 必须与「命中筛选」用的 cap 分开：
+                // 闸门放宽/忽略后若仍拿旧 cap 去扩窗，锚点自己也会被过滤掉 → 返回空
+                let expandCap = chapterCap;
                 if (chapterCap !== null) {
                     const withinCap = (r, cap) => {
                         const chapterIndex =
@@ -3139,11 +3142,13 @@ async function init(router) {
                             .slice(0, simpleCount);
                         if (relaxed.length > 0) {
                             hits = relaxed;
+                            expandCap = chapterCap + 1;
                             console.warn(
                                 `[Anima ChapterGate] ⚠️ 第 ${chapterCap} 章无命中，已放宽到第 ${chapterCap + 1} 章`,
                             );
                         } else {
                             hits = base.slice(0, simpleCount);
+                            expandCap = null;
                             console.warn(
                                 `[Anima ChapterGate] ⚠️ 第 ${chapterCap} 章及其后均无命中，已忽略闸门（请检查「当前章节」是否滞后）`,
                             );
@@ -3161,11 +3166,19 @@ async function init(router) {
                 console.log(
                     `[Anima Neighbor] 🎯 最佳命中 ch${anchor.item?.metadata?.chapter_index}/ck${anchor.item?.metadata?.chunk_index}，仅保留 ±${neighborBack}/${neighborForward} 前后文`,
                 );
-                return expandNeighbors([anchor], anchorOutline, {
+                const anchorWindow = expandNeighbors([anchor], anchorOutline, {
                     back: neighborBack,
                     forward: neighborForward,
-                    chapterCap,
+                    chapterCap: expandCap,
                 });
+                // 🛡️ 兜底：扩窗若因任何原因为空，至少保留最佳命中本身（绝不清空召回）
+                if (anchorWindow.length === 0) {
+                    console.warn(
+                        "[Anima Neighbor] ⚠️ 扩窗结果为空（锚点超出章节闸门？），已回退为仅最佳命中",
+                    );
+                    return [anchor];
+                }
+                return anchorWindow;
             };
             tasks.push(kbTask());
 

@@ -3080,7 +3080,7 @@ async function init(router) {
                 });
 
                 if (chapterCap !== null) {
-                    hits = hits.filter((r) => {
+                    const withinCap = (r, cap) => {
                         const chapterIndex =
                             r.item && r.item.metadata
                                 ? r.item.metadata.chapter_index
@@ -3088,9 +3088,33 @@ async function init(router) {
                         return (
                             chapterIndex === undefined ||
                             chapterIndex === null ||
-                            Number(chapterIndex) <= chapterCap
+                            Number(chapterIndex) <= cap
                         );
-                    });
+                    };
+                    const gated = hits.filter((r) => withinCap(r, chapterCap));
+                    if (gated.length > 0) {
+                        hits = gated;
+                    } else {
+                        // 🛡️ 兜底：<= 当前章节 无命中（多半是"当前章节"滞后），
+                        // 先放宽一章，再不行就忽略闸门，避免出现"空检索"
+                        const base = raw
+                            .filter((r) => r.score >= minScore)
+                            .sort((a, b) => b.score - a.score);
+                        const relaxed = base
+                            .filter((r) => withinCap(r, chapterCap + 1))
+                            .slice(0, simpleCount);
+                        if (relaxed.length > 0) {
+                            hits = relaxed;
+                            console.warn(
+                                `[Anima ChapterGate] ⚠️ 第 ${chapterCap} 章无命中，已放宽到第 ${chapterCap + 1} 章`,
+                            );
+                        } else {
+                            hits = base.slice(0, simpleCount);
+                            console.warn(
+                                `[Anima ChapterGate] ⚠️ 第 ${chapterCap} 章及其后均无命中，已忽略闸门（请检查「当前章节」是否滞后）`,
+                            );
+                        }
+                    }
                 }
 
                 if (!neighborEnabled) return hits;

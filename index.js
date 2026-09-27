@@ -12,6 +12,20 @@ const {
 const {
     getDictionaryAffectedTerms,
 } = require("./dictionary_reindex");
+const { chunkDocument } = require("./chunking");
+const { resolveChapterGate } = require("./chapter_gate");
+const {
+    buildOutline,
+    createOutlineCache,
+    expandNeighbors,
+} = require("./outline");
+const { diffMissing } = require("./vector_status");
+const { ensureSettingsFile, getAnimaSettings } = require("./settings");
+const {
+    buildContextMessages,
+    buildEmbeddingText,
+    sanitizeContext,
+} = require("./contextual");
 
 let stProxyConfig = {
     enabled: false,
@@ -45,6 +59,112 @@ const SESSION_ROOT = path.join(__dirname, "data", "sessions");
 const activeIndexes = new Map();
 const writeQueues = new Map();
 const loadingPromises = new Map();
+
+const BM25_ROOT = path.join(__dirname, "data", "bm25_indexes");
+const outlineCache = createOutlineCache();
+
+function toSafeName(id) {
+    if (id === undefined || id === null) return "";
+    return String(id).replace(/[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g, "_");
+}
+
+function toPositiveNumber(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+async function getOutline(collectionId) {
+    const safeName = toSafeName(collectionId);
+    const anima = getAnimaSettings();
+    const ttlMs = toPositiveNumber(
+        anima.outline && anima.outline.ttlMs,
+        15000,
+    );
+    const cached = outlineCache.get(safeName, ttlMs);
+    if (cached) return cached;
+    const idx = await getIndex(collectionId, false);
+    if (!idx) return null;
+    const items = await readItemsWithFullMetadata(
+        idx,
+        path.join(VECTOR_ROOT, safeName),
+    );
+    const outline = buildOutline(items, {
+        chapterPatterns: anima.chunking && anima.chunking.chapterPatterns,
+    });
+    outlineCache.set(safeName, outline);
+    return outline;
+}
+
+function invalidateOutline(collectionId) {
+    outlineCache.invalidate(toSafeName(collectionId));
+}
+
+async function readItemsWithFullMetadata(indexInstance, collectionPath, entries) {
+    const list = entries || (await indexInstance.listItems());
+    const needsFull = list.some(
+        (entry) => !entry.metadata || entry.metadata.chunk_index === undefined,
+    );
+    if (!needsFull) {
+        return list.map((entry) => ({ id: entry.id, metadata: entry.metadata }));
+    }
+    const out = [];
+    for (const entry of list) {
+        try {
+            const fileName = entry.metadataFile || `${entry.id}.json`;
+            const filePath = path.join(collectionPath, fileName);
+            if (!fs.existsSync(filePath)) {
+                out.push({ id: entry.id, metadata: entry.metadata || {} });
+                continue;
+            }
+            const full = JSON.parse(
+                await fs.promises.readFile(filePath, "utf8"),
+            );
+            out.push({ id: entry.id, metadata: full.metadata || full });
+        } catch (e) {
+            out.push({ id: entry.id, metadata: entry.metadata || {} });
+        }
+    }
+    return out;
+}
+
+
+async function computeVectorStatus(collectionId) {
+    const safeName = toSafeName(collectionId);
+    const bm25Path = path.join(BM25_ROOT, `${safeName}.json`);
+    if (!fs.existsSync(bm25Path)) return null;
+
+    let docs = [];
+    try {
+        const data = JSON.parse(await fs.promises.readFile(bm25Path, "utf8"));
+        docs = Object.values(data.storedFields || {});
+    } catch (e) {
+        console.warn(`[Anima VectorStatus] 读取 BM25 失败: ${e.message}`);
+        return null;
+    }
+
+    const idx = await getIndex(collectionId, false);
+    const vectorItems = idx
+        ? await readItemsWithFullMetadata(
+              idx,
+              path.join(VECTOR_ROOT, safeName),
+          )
+        : [];
+    const result = diffMissing(docs, vectorItems);
+
+    return {
+        total: result.total,
+        vectorized: result.vectorized,
+        missingCount: result.missing.length,
+        missing: result.missing.map((m) => ({
+            doc_name: m.doc_name,
+            chunk_index: m.chunk_index,
+            chapter_index: m.chapter_index,
+            chapter_title: m.chapter_title,
+            preview: (m.text || "").slice(0, 80),
+        })),
+    };
+}
+
 const SPECIAL_TAGS = [
     "Halloween",
     "Christmas",
@@ -66,62 +186,6 @@ const EMBEDDING_CONFIG = {
     model: "text-embedding-3-large",
 };
 
-// 🟢 [新增] 智能文本切片工具
-function chunkText(text, strategy) {
-    const { delimiter, chunkSize } = strategy;
-
-    // 模式 A: 自定义分隔符 (优先)
-    if (delimiter && delimiter.trim() !== "") {
-        // 使用 split 分割，并过滤掉空行
-        return text
-            .split(delimiter)
-            .map((t) => t.trim())
-            .filter((t) => t.length > 0);
-    }
-
-    // 模式 B: 字符数 + 智能截断
-    // 逻辑：每隔 chunkSize 切一刀，然后向后找最近的 \n 或 。
-    const chunks = [];
-    let startIndex = 0;
-    const limit = parseInt(chunkSize) || 500;
-    const totalLen = text.length;
-
-    while (startIndex < totalLen) {
-        let endIndex = startIndex + limit;
-
-        if (endIndex >= totalLen) {
-            endIndex = totalLen;
-        } else {
-            // 智能寻找断点：优先找换行，其次找句号/问号/感叹号
-            // 在 limit 之后的 100 个字符内寻找，避免无限延长
-            const searchWindow = text.substring(endIndex, endIndex + 100);
-
-            // 1. 尝试找换行符
-            let offset = searchWindow.indexOf("\n");
-
-            // 2. 如果没换行，找句子结束符
-            if (offset === -1) {
-                const punctuationMatch = searchWindow.match(/[。.?!？！]/);
-                if (punctuationMatch) {
-                    offset = punctuationMatch.index;
-                }
-            }
-
-            // 3. 如果找到了合适的断点，就延伸过去；否则硬切
-            if (offset !== -1) {
-                endIndex += offset + 1; // 包含标点
-            }
-        }
-
-        const chunk = text.substring(startIndex, endIndex).trim();
-        if (chunk) chunks.push(chunk);
-
-        // 下一段从当前结束点开始
-        startIndex = endIndex;
-    }
-
-    return chunks;
-}
 
 async function loadSession(sessionId) {
     if (!sessionId) return { memories: [] };
@@ -487,12 +551,168 @@ async function fetchRerank(query, documents, config) {
     }
 }
 
+async function fetchChatCompletion(messages, config) {
+    if (!config || !config.key) throw new Error("Chat API Key missing");
+    const base = String(config.url || "").replace(/\/+$/, "");
+    if (!base) throw new Error("Chat API URL missing");
+    const url = base + "/chat/completions";
+
+    const controller = new AbortController();
+    const timeoutMs = (Number(config.timeout) || 60) * 1000;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: "Bearer " + config.key,
+            },
+            body: JSON.stringify({
+                model: config.model,
+                messages: messages,
+                temperature:
+                    config.temperature === undefined
+                        ? 0.3
+                        : config.temperature,
+                max_tokens: config.max_output || 1024,
+                stream: false,
+            }),
+            signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) {
+            const t = await response.text();
+            throw new Error("HTTP " + response.status + ": " + t.slice(0, 120));
+        }
+        const data = await response.json();
+        const msg =
+            data &&
+            data.choices &&
+            data.choices[0] &&
+            data.choices[0].message
+                ? data.choices[0].message
+                : null;
+        // 兼容推理模型：答案可能在 content / reasoning_content / reasoning
+        const content = msg
+            ? msg.content || msg.reasoning_content || msg.reasoning
+            : null;
+        if (!content) throw new Error("模型返回空内容");
+        return content;
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (e.name === "AbortError") throw new Error("语境生成超时");
+        throw e;
+    }
+}
+
+function resolveContextualConfig(requestConfig, animaSettings) {
+    const defaults = (animaSettings && animaSettings.contextual) || {};
+    const req = requestConfig || {};
+    const chat = Object.assign({}, defaults.chat || {}, req.chat || {});
+    return {
+        enabled:
+            req.enabled === undefined
+                ? defaults.enabled === true
+                : req.enabled === true,
+        chat: chat,
+        maxContextChars:
+            req.maxContextChars || defaults.maxContextChars || 160,
+        neighborChars: req.neighborChars || defaults.neighborChars || 700,
+    };
+}
+
+async function buildChunkContexts(chunks, fileName, cfg) {
+    const contexts = new Array(chunks.length).fill("");
+    let generated = 0;
+    let failed = 0;
+    for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
+        const prev = i > 0 && chunks[i - 1].chapterIndex === c.chapterIndex ? i - 1 : -1;
+        const next = i + 1 < chunks.length && chunks[i + 1].chapterIndex === c.chapterIndex ? i + 1 : -1;
+        const prevText = prev >= 0 ? String(chunks[prev].text || "").slice(-cfg.neighborChars) : "";
+        const nextText = next >= 0 ? String(chunks[next].text || "").slice(0, cfg.neighborChars) : "";
+        try {
+            const messages = buildContextMessages({
+                docName: fileName,
+                chapterTitle: c.chapterTitle,
+                prevText: prevText,
+                chunkText: c.text,
+                nextText: nextText,
+                maxContextChars: cfg.maxContextChars,
+            });
+            const raw = await fetchChatCompletion(messages, cfg.chat);
+            const ctx = sanitizeContext(raw, cfg.maxContextChars);
+            if (ctx) {
+                contexts[i] = ctx;
+                generated++;
+            } else failed++;
+        } catch (e) {
+            failed++;
+            if (failed <= 3)
+                console.warn(
+                    "[Anima Contextual] \u26A0\uFE0F 语境生成失败 #" + i + ": " + e.message,
+                );
+        }
+    }
+    return { contexts: contexts, generated: generated, failed: failed };
+}
+
+
+async function rerankKbHits(hits, searchText, strategy = {}, rerankConfig = {}) {
+    if (!Array.isArray(hits) || hits.length === 0) return hits || [];
+    const cfg = rerankConfig || {};
+    const enabled =
+        strategy.rerank_enabled === undefined
+            ? cfg.enabled === true
+            : strategy.rerank_enabled === true;
+    if (!enabled || !cfg.api || !cfg.api.url || !cfg.api.key || !searchText) {
+        return hits;
+    }
+
+    const topN = Math.max(parseInt(cfg.count) || 30, 1);
+    const candidates = hits.slice(0, topN);
+    const documents = candidates.map((hit) => ({
+        text:
+            hit.item && hit.item.metadata
+                ? hit.item.metadata.text || ""
+                : "",
+    }));
+
+    try {
+        const results = await fetchRerank(searchText, documents, cfg.api);
+        if (!Array.isArray(results) || results.length === 0) return hits;
+        const ranked = [];
+        for (const r of results) {
+            const src = candidates[r.index];
+            if (!src) continue;
+            src._rerank_score = r.relevance_score;
+            ranked.push(src);
+        }
+        console.log(
+            `[Anima Rerank] \u{1F3AF} KB 重排完成 | 候选 ${candidates.length} | 返回 ${ranked.length}`,
+        );
+        return [...ranked, ...hits.slice(topN)];
+    } catch (e) {
+        console.warn(
+            `[Anima Rerank] \u26A0\uFE0F KB 重排失败，回退原顺序: ${e.message}`,
+        );
+        return hits;
+    }
+}
+
+
 async function runInQueue(collectionId, task) {
     if (!writeQueues.has(collectionId)) {
         writeQueues.set(collectionId, Promise.resolve());
     }
     // 将任务追加到该 ID 的 Promise 链末尾
-    const taskPromise = writeQueues.get(collectionId).then(() => task());
+    const taskPromise = writeQueues
+        .get(collectionId)
+        .then(() => task())
+        .then((result) => {
+            invalidateOutline(collectionId);
+            return result;
+        });
     writeQueues.set(
         collectionId,
         taskPromise.catch(() => {}),
@@ -538,7 +758,16 @@ async function getIndex(collectionId, allowCreate = true) {
         if (!(await indexInstance.isIndexCreated())) {
             await indexInstance.createIndex({
                 version: 1,
-                metadata_config: { indexed: ["tags", "index", "batch_id"] },
+                metadata_config: {
+                    indexed: [
+                        "tags",
+                        "index",
+                        "batch_id",
+                        "chunk_index",
+                        "chapter_index",
+                        "doc_name",
+                    ],
+                },
             });
         }
 
@@ -1242,6 +1471,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 }
 
 async function init(router) {
+    ensureSettingsFile();
+
     if (!fs.existsSync(VECTOR_ROOT)) {
         fs.mkdirSync(VECTOR_ROOT, { recursive: true });
     }
@@ -1513,6 +1744,9 @@ async function init(router) {
             .replace(/[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g, "_");
         const collectionId = `kb_${safeName}`;
 
+        // 🟢 向量覆盖率统计（成功/失败都会回传，供前端提示与补全）
+        const importStats = { total: 0, vectorized: 0, failed: [] };
+
         console.log(
             `[Anima KB] 📚 处理知识库: ${collectionId} | Vector: ${writeVector} | BM25: ${bm25Config?.enabled}`,
         );
@@ -1539,20 +1773,66 @@ async function init(router) {
                     cleanIndex = await getIndex(collectionId, true);
                 }
 
-                // 4. 切片
-                const chunks = chunkText(fileContent, {
-                    delimiter: settings.delimiter,
-                    chunkSize: settings.chunk_size,
+                // 4. 切片（章节感知；auto 模式检不出章标题时自动回退旧逻辑）
+                const kbSettings = settings || {};
+                const anima = getAnimaSettings();
+                const chunks = chunkDocument(fileContent, {
+                    mode: kbSettings.chunk_mode || anima.chunking.mode,
+                    chapterPatterns:
+                        Array.isArray(kbSettings.chapter_patterns) &&
+                        kbSettings.chapter_patterns.length > 0
+                            ? kbSettings.chapter_patterns
+                            : anima.chunking.chapterPatterns,
+                    minChars:
+                        kbSettings.min_chunk_size || anima.chunking.minChars,
+                    maxChars:
+                        kbSettings.max_chunk_size || anima.chunking.maxChars,
+                    legacyDelimiter: kbSettings.delimiter,
+                    legacyChunkSize: kbSettings.chunk_size,
                 });
 
                 console.log(
                     `[Anima KB] 切片完成，共 ${chunks.length} 个片段。开始处理...`,
                 );
                 const bm25Chunks = [];
+                importStats.total = chunks.length;
+
+                // 🟢 上下文检索：入库前为每片生成语境（可选）
+                const contextualCfg = resolveContextualConfig(
+                    req.body.contextualConfig,
+                    anima,
+                );
+                let chunkContexts = null;
+                if (
+                    contextualCfg.enabled &&
+                    contextualCfg.chat &&
+                    contextualCfg.chat.key &&
+                    contextualCfg.chat.model
+                ) {
+                    console.log(
+                        `[Anima Contextual] 🧠 开始为 ${chunks.length} 片生成语境 (${contextualCfg.chat.model})...`,
+                    );
+                    const built = await buildChunkContexts(
+                        chunks,
+                        fileName,
+                        contextualCfg,
+                    );
+                    chunkContexts = built.contexts;
+                    importStats.contextual = {
+                        generated: built.generated,
+                        failed: built.failed,
+                    };
+                    console.log(
+                        `[Anima Contextual] ✅ 语境完成: 成功 ${built.generated} / 失败 ${built.failed}`,
+                    );
+                }
 
                 // 5. 循环处理切片
                 for (let i = 0; i < chunks.length; i++) {
-                    const chunkText = chunks[i];
+                    const chunk = chunks[i];
+                    const chunkText = chunk.text;
+                    const chunkIndex =
+                        chunk.chunkIndex === undefined ? i : chunk.chunkIndex;
 
                     // 🌟 默认生成一个随机 ID (如果不开向量库，BM25 依然需要 ID 才能运作)
                     let documentId = `chunk_${i}_${Date.now()}`;
@@ -1560,32 +1840,51 @@ async function init(router) {
                     // 🌟 如果开启了向量化，调用模型 API
                     if (writeVector) {
                         try {
-                            const vector = await getEmbedding(
+                            const embedText = buildEmbeddingText(
+                                chunkContexts ? chunkContexts[i] : "",
                                 chunkText,
+                            );
+                            const vector = await getEmbedding(
+                                embedText,
                                 apiConfig,
                             );
                             const insertedItem = await cleanIndex.insertItem({
                                 vector: vector,
                                 metadata: {
                                     text: chunkText,
+                                    context:
+                                        chunkContexts && chunkContexts[i]
+                                            ? chunkContexts[i]
+                                            : undefined,
                                     doc_name: fileName,
                                     source_type: "knowledge",
-                                    chunk_index: i,
+                                    chunk_index: chunkIndex,
+                                    chapter_index: chunk.chapterIndex,
+                                    chapter_title: chunk.chapterTitle,
+                                    chunk_in_chapter: chunk.chunkInChapter,
                                     timestamp: Date.now(),
                                 },
                             });
                             // 替换为真实的向量库 UUID
                             documentId = insertedItem.id;
+                            importStats.vectorized += 1;
 
-                            if ((i + 1) % 10 === 0)
+                            if (importStats.vectorized % 10 === 0)
                                 console.log(
-                                    `[Anima KB] 向量化进度: ${i + 1}/${chunks.length}`,
+                                    `[Anima KB] 向量化进度: ${importStats.vectorized}/${chunks.length}`,
                                 );
                         } catch (err) {
                             console.error(
-                                `[Anima KB] 片段 ${i} 向量化失败:`,
+                                `[Anima KB] 片段 ${chunkIndex} 向量化失败:`,
                                 err.message,
                             );
+                            importStats.failed.push({
+                                chunk_index: chunkIndex,
+                                chapter_index: chunk.chapterIndex,
+                                chapter_title: chunk.chapterTitle,
+                                reason: err.message,
+                                preview: chunkText.slice(0, 80),
+                            });
                         }
                     }
 
@@ -1593,7 +1892,14 @@ async function init(router) {
                     bm25Chunks.push({
                         id: documentId,
                         text: chunkText,
-                        chunk_index: i,
+                        context:
+                            chunkContexts && chunkContexts[i]
+                                ? chunkContexts[i]
+                                : undefined,
+                        chunk_index: chunkIndex,
+                        chunk_in_chapter: chunk.chunkInChapter,
+                        chapter_index: chunk.chapterIndex,
+                        chapter_title: chunk.chapterTitle,
                         doc_name: fileName,
                         timestamp: Date.now(),
                     });
@@ -1621,7 +1927,19 @@ async function init(router) {
                 }
             });
 
-            res.json({ success: true, collectionId: collectionId, count: 0 });
+            if (importStats.failed.length > 0) {
+                console.warn(
+                    `[Anima KB] ⚠️ ${importStats.failed.length}/${importStats.total} 个切片向量化失败，可在知识库管理里补全`,
+                );
+            }
+            res.json({
+                success: true,
+                collectionId: collectionId,
+                total: importStats.total,
+                vectorized: importStats.vectorized,
+                contextual: importStats.contextual,
+                failed: importStats.failed,
+            });
         } catch (err) {
             console.error("[Anima KB Error]", err);
             res.status(500).send(err.message);
@@ -2253,6 +2571,267 @@ async function init(router) {
     // ==========================================
     // 🔍 改造后的查询接口 (支持并行双轨检索)
     // ==========================================
+    // ==========================================
+    // 🟢 新增：向量覆盖率 + 缺失片补全
+    // ==========================================
+    router.post("/kb_vector_status", async (req, res) => {
+        const { collectionId } = req.body;
+        if (!collectionId)
+            return res
+                .status(400)
+                .json({ success: false, message: "Missing collectionId" });
+        try {
+            const status = await computeVectorStatus(collectionId);
+            if (!status)
+                return res.status(404).json({
+                    success: false,
+                    message: "未找到该库的 BM25 数据，无法比对向量覆盖率",
+                });
+            res.json({ success: true, collectionId, ...status });
+        } catch (e) {
+            console.error(`[Anima VectorStatus] 查询失败: ${e.message}`);
+            res.status(500).json({ success: false, message: e.message });
+        }
+    });
+
+    router.post("/kb_vector_status_all", async (req, res) => {
+        try {
+            const results = {};
+            if (fs.existsSync(BM25_ROOT)) {
+                const entries = fs.readdirSync(BM25_ROOT, {
+                    withFileTypes: true,
+                });
+                for (const dirent of entries) {
+                    if (!dirent.isFile() || !dirent.name.endsWith(".json"))
+                        continue;
+                    const libName = dirent.name.replace(/\.json$/, "");
+                    if (!libName.startsWith("kb_")) continue;
+                    try {
+                        const status = await computeVectorStatus(libName);
+                        if (status) {
+                            results[libName] = {
+                                total: status.total,
+                                vectorized: status.vectorized,
+                                missingCount: status.missingCount,
+                                missingChunks: status.missing
+                                    .slice(0, 20)
+                                    .map((m) => m.chunk_index),
+                            };
+                        }
+                    } catch (e) {
+                        results[libName] = { error: e.message };
+                    }
+                }
+            }
+            res.json({ success: true, results });
+        } catch (e) {
+            res.status(500).json({ success: false, message: e.message });
+        }
+    });
+
+    router.post("/kb_vectorize_missing", async (req, res) => {
+        const { collectionId, apiConfig } = req.body;
+        if (!collectionId)
+            return res
+                .status(400)
+                .json({ success: false, message: "Missing collectionId" });
+        if (!apiConfig || !apiConfig.key)
+            return res
+                .status(400)
+                .json({ success: false, message: "Missing API Config" });
+
+        const safeName = toSafeName(collectionId);
+        const bm25Path = path.join(BM25_ROOT, `${safeName}.json`);
+        if (!fs.existsSync(bm25Path))
+            return res.status(404).json({
+                success: false,
+                message: "该库没有 BM25 数据，缺失切片的原文无法找回，请重新导入",
+            });
+
+        try {
+            await runInQueue(safeName, async () => {
+                const data = JSON.parse(
+                    await fs.promises.readFile(bm25Path, "utf8"),
+                );
+                const docs = Object.values(data.storedFields || {});
+                const targetIndex = await getIndex(safeName, true);
+                const vectorItems = await readItemsWithFullMetadata(
+                    targetIndex,
+                    path.join(VECTOR_ROOT, safeName),
+                );
+                const { missing } = diffMissing(docs, vectorItems);
+
+                let vectorized = 0;
+                const failed = [];
+                for (const item of missing) {
+                    if (!item.text) continue;
+                    try {
+                        const vector = await getEmbedding(item.text, apiConfig);
+                        await targetIndex.insertItem({
+                            vector: vector,
+                            metadata: {
+                                text: item.text,
+                                doc_name: item.doc_name,
+                                source_type: "knowledge",
+                                chunk_index: item.chunk_index,
+                                chapter_index: item.chapter_index,
+                                chapter_title: item.chapter_title,
+                                timestamp: Date.now(),
+                            },
+                        });
+                        vectorized += 1;
+                        if (vectorized % 10 === 0)
+                            console.log(
+                                `[Anima VectorStatus] 补全进度: ${vectorized}/${missing.length}`,
+                            );
+                    } catch (e) {
+                        failed.push({
+                            chunk_index: item.chunk_index,
+                            reason: e.message,
+                        });
+                    }
+                }
+
+                console.log(
+                    `[Anima VectorStatus] ✅ 补全完成 | 缺失: ${missing.length} | 成功: ${vectorized} | 失败: ${failed.length}`,
+                );
+                res.json({
+                    success: true,
+                    requested: missing.length,
+                    vectorized,
+                    failed,
+                });
+            });
+        } catch (e) {
+            console.error(`[Anima VectorStatus] 补全失败: ${e.message}`);
+            res.status(500).json({ success: false, message: e.message });
+        }
+    });
+
+    // ==========================================
+    // 🟢 新增：为旧库补生成语境（上下文检索回填）
+    // ==========================================
+    router.post("/contextualize_collection", async (req, res) => {
+        const { collectionId, apiConfig, contextualConfig } = req.body;
+        if (!collectionId)
+            return res
+                .status(400)
+                .json({ success: false, message: "Missing collectionId" });
+        if (!apiConfig || !apiConfig.key)
+            return res
+                .status(400)
+                .json({ success: false, message: "Missing API Config" });
+
+        const safeName = toSafeName(collectionId);
+        try {
+            await runInQueue(safeName, async () => {
+                const anima = getAnimaSettings();
+                const cfg = resolveContextualConfig(contextualConfig, anima);
+                if (
+                    !cfg.enabled ||
+                    !cfg.chat ||
+                    !cfg.chat.key ||
+                    !cfg.chat.model
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "未启用上下文检索，或缺少 chat 模型配置",
+                    });
+                }
+                const targetIndex = await getIndex(safeName, false);
+                if (!targetIndex)
+                    return res
+                        .status(404)
+                        .json({ success: false, message: "向量库不存在" });
+
+                const items = await readItemsWithFullMetadata(
+                    targetIndex,
+                    path.join(VECTOR_ROOT, safeName),
+                );
+                const ordered = items
+                    .slice()
+                    .sort(
+                        (a, b) =>
+                            (Number(a.metadata.chunk_index) || 0) -
+                            (Number(b.metadata.chunk_index) || 0),
+                    );
+
+                let updated = 0;
+                const failed = [];
+                for (let i = 0; i < ordered.length; i++) {
+                    const meta = ordered[i].metadata || {};
+                    const prev =
+                        i > 0 &&
+                        ordered[i - 1].metadata.chapter_index ===
+                            meta.chapter_index
+                            ? String(ordered[i - 1].metadata.text || "").slice(
+                                  -cfg.neighborChars,
+                              )
+                            : "";
+                    const next =
+                        i + 1 < ordered.length &&
+                        ordered[i + 1].metadata.chapter_index ===
+                            meta.chapter_index
+                            ? String(ordered[i + 1].metadata.text || "").slice(
+                                  0,
+                                  cfg.neighborChars,
+                              )
+                            : "";
+                    try {
+                        const messages = buildContextMessages({
+                            docName: meta.doc_name,
+                            chapterTitle: meta.chapter_title,
+                            prevText: prev,
+                            chunkText: meta.text || "",
+                            nextText: next,
+                            maxContextChars: cfg.maxContextChars,
+                        });
+                        const ctx = sanitizeContext(
+                            await fetchChatCompletion(messages, cfg.chat),
+                            cfg.maxContextChars,
+                        );
+                        const vector = await getEmbedding(
+                            buildEmbeddingText(ctx, meta.text || ""),
+                            apiConfig,
+                        );
+                        await targetIndex.deleteItem(ordered[i].id);
+                        await targetIndex.insertItem({
+                            vector: vector,
+                            metadata: Object.assign({}, meta, {
+                                context: ctx || undefined,
+                            }),
+                        });
+                        updated++;
+                        if (updated % 10 === 0)
+                            console.log(
+                                `[Anima Contextual] 回填进度: ${updated}/${ordered.length}`,
+                            );
+                    } catch (e) {
+                        failed.push({
+                            chunk_index: meta.chunk_index,
+                            reason: e.message,
+                        });
+                    }
+                }
+
+                invalidateOutline(safeName);
+                console.log(
+                    `[Anima Contextual] ✅ 回填完成 | 总数 ${ordered.length} | 成功 ${updated} | 失败 ${failed.length}`,
+                );
+                res.json({
+                    success: true,
+                    total: ordered.length,
+                    updated: updated,
+                    failed: failed,
+                });
+            });
+        } catch (e) {
+            console.error("[Anima Contextual] 回填失败: " + e.message);
+            res.status(500).json({ success: false, message: e.message });
+        }
+    });
+
+
     router.post("/query", async (req, res) => {
         try {
             const {
@@ -2472,11 +3051,74 @@ async function init(router) {
                     "KB",
                 );
 
-                raw = raw
+                let hits = raw
                     .filter((r) => r.score >= minScore)
+                    .sort((a, b) => b.score - a.score)
                     .slice(0, simpleCount);
 
-                return raw;
+                // 🟢 KB 结果重排（可选，需配置重排模型）
+                hits = await rerankKbHits(hits, searchText, strat, rerankConfig);
+
+                const anima = getAnimaSettings();
+                const neighborEnabled =
+                    strat.neighbor_enabled === undefined
+                        ? anima.neighbors.enabled === true
+                        : strat.neighbor_enabled === true;
+                const neighborBack =
+                    strat.neighbor_back === undefined
+                        ? anima.neighbors.back
+                        : strat.neighbor_back;
+                const neighborForward =
+                    strat.neighbor_forward === undefined
+                        ? anima.neighbors.forward
+                        : strat.neighbor_forward;
+
+                const chapterCap = resolveChapterGate({
+                    searchText,
+                    kbStrategy: strat,
+                    animaSettings: anima,
+                });
+
+                if (chapterCap !== null) {
+                    hits = hits.filter((r) => {
+                        const chapterIndex =
+                            r.item && r.item.metadata
+                                ? r.item.metadata.chapter_index
+                                : null;
+                        return (
+                            chapterIndex === undefined ||
+                            chapterIndex === null ||
+                            Number(chapterIndex) <= chapterCap
+                        );
+                    });
+                }
+
+                if (!neighborEnabled) return hits;
+
+                const hitsBySource = new Map();
+                for (const hit of hits) {
+                    const src = hit._source_collection || "__default__";
+                    if (!hitsBySource.has(src)) hitsBySource.set(src, []);
+                    hitsBySource.get(src).push(hit);
+                }
+
+                const expanded = [];
+                for (const [src, srcHits] of hitsBySource) {
+                    const outline = await getOutline(src);
+                    if (!outline) {
+                        expanded.push(...srcHits);
+                        continue;
+                    }
+                    expanded.push(
+                        ...expandNeighbors(srcHits, outline, {
+                            back: neighborBack,
+                            forward: neighborForward,
+                            chapterCap,
+                        }),
+                    );
+                }
+
+                return expanded;
             };
             tasks.push(kbTask());
 
@@ -2857,12 +3499,26 @@ async function init(router) {
                 const strat = kbContext.strategy || {};
                 const bm25Count = strat.bm25_top_k || 3;
 
-                const results = await bm25Engine.searchPipeline(
+                let results = await bm25Engine.searchPipeline(
                     boostedQuery,
                     bm25Configs.kb,
                     bm25Count,
                     "kb",
                 );
+
+                const kbChapterCap = resolveChapterGate({
+                    searchText,
+                    kbStrategy: strat,
+                    animaSettings: getAnimaSettings(),
+                });
+                if (kbChapterCap !== null) {
+                    results = results.filter(
+                        (r) =>
+                            r.chapter_index === undefined ||
+                            r.chapter_index === null ||
+                            Number(r.chapter_index) <= kbChapterCap,
+                    );
+                }
 
                 bm25KbResults = results.map((r) => {
                     const src =
@@ -3049,6 +3705,8 @@ async function init(router) {
                     timestamp: r.item.metadata.timestamp,
                     index: r.item.metadata.index,
                     chunk_index: r.item.metadata.chunk_index,
+                    chapter_index: r.item.metadata.chapter_index,
+                    chapter_title: r.item.metadata.chapter_title,
                     batch_id: r.item.metadata.batch_id,
                     source: r["_source_collection"] || "unknown",
                     doc_name: r.item.metadata.doc_name,
@@ -3121,11 +3779,24 @@ async function init(router) {
 
                 const merged = Array.from(uniqueMap.values());
 
-                // 先按文档名称，再按切片序号排序
+                // 排序优先级：章节号 > 文档名(数字感知) > 切片序号
+                const asNum = (v) => {
+                    const n = Number(v);
+                    return Number.isFinite(n) ? n : null;
+                };
                 merged.sort((a, b) => {
+                    const ca = asNum(a.chapter_index);
+                    const cb = asNum(b.chapter_index);
+                    if (ca !== null && cb !== null && ca !== cb) {
+                        return ca - cb;
+                    }
                     const docA = a.doc_name || "";
                     const docB = b.doc_name || "";
-                    if (docA !== docB) return docA.localeCompare(docB);
+                    if (docA !== docB) {
+                        return docA.localeCompare(docB, undefined, {
+                            numeric: true,
+                        });
+                    }
                     return (a.chunk_index || 0) - (b.chunk_index || 0);
                 });
                 return merged;

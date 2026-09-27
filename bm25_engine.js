@@ -262,11 +262,15 @@ class BM25Engine {
             storeFields: [
                 "id",
                 "text",
+                "context",
                 "tags",
                 "timestamp",
                 "index",
                 "batch_id",
                 "chunk_index",
+                "chunk_in_chapter",
+                "chapter_index",
+                "chapter_title",
                 "doc_name",
                 "_source_db",
             ],
@@ -276,7 +280,11 @@ class BM25Engine {
         });
 
         const documents = chunks.map((chunk) => {
-            let searchableParts = [chunk.text];
+            let searchableParts = [
+                chunk.context
+                    ? chunk.context + " " + chunk.text
+                    : chunk.text,
+            ];
             let finalTags = []; // 🟢 BM25专属标签池，完全由词典决定！
 
             dictionary.forEach((rule) => {
@@ -357,11 +365,15 @@ class BM25Engine {
                 storeFields: [
                     "id",
                     "text",
+                    "context",
                     "tags",
                     "timestamp",
                     "index",
                     "batch_id",
                     "chunk_index",
+                    "chunk_in_chapter",
+                    "chapter_index",
+                    "chapter_title",
                     "doc_name",
                     "_source_db",
                 ],
@@ -374,11 +386,15 @@ class BM25Engine {
                 storeFields: [
                     "id",
                     "text",
+                    "context",
                     "tags",
                     "timestamp",
                     "index",
                     "batch_id",
                     "chunk_index",
+                    "chunk_in_chapter",
+                    "chapter_index",
+                    "chapter_title",
                     "doc_name",
                     "_source_db",
                 ],
@@ -394,7 +410,11 @@ class BM25Engine {
         // 3. 内存中批量分词与索引构建
         for (const slice of slices) {
             // ⚠️ 修复：把单条插入的词典判断逻辑补回来！
-            let searchableParts = [slice.text];
+            let searchableParts = [
+                slice.context
+                    ? slice.context + " " + slice.text
+                    : slice.text,
+            ];
             let finalTags = [];
 
             dictionary.forEach((rule) => {
@@ -531,11 +551,15 @@ class BM25Engine {
                     storeFields: [
                         "id",
                         "text",
+                        "context",
                         "tags",
                         "timestamp",
                         "index",
                         "batch_id",
                         "chunk_index",
+                        "chunk_in_chapter",
+                        "chapter_index",
+                        "chapter_title",
                         "doc_name",
                         "_source_db",
                     ],
@@ -547,11 +571,15 @@ class BM25Engine {
                     storeFields: [
                         "id",
                         "text",
+                        "context",
                         "tags",
                         "timestamp",
                         "index",
                         "batch_id",
                         "chunk_index",
+                        "chunk_in_chapter",
+                        "chapter_index",
+                        "chapter_title",
                         "doc_name",
                         "_source_db",
                     ],
@@ -563,7 +591,9 @@ class BM25Engine {
         }
 
         // 2. 处理单条数据
-        let searchableParts = [chunk.text];
+        let searchableParts = [
+            chunk.context ? chunk.context + " " + chunk.text : chunk.text,
+        ];
         let finalTags = [];
 
         dictionary.forEach((rule) => {
@@ -662,11 +692,15 @@ class BM25Engine {
                         storeFields: [
                             "id",
                             "text",
+                            "context",
                             "tags",
                             "timestamp",
                             "index",
                             "batch_id",
                             "chunk_index",
+                            "chunk_in_chapter",
+                            "chapter_index",
+                            "chapter_title",
                             "doc_name",
                             "_source_db",
                         ],
@@ -893,11 +927,15 @@ class BM25Engine {
                         storeFields: [
                             "id",
                             "text",
+                            "context",
                             "tags",
                             "timestamp",
                             "index",
                             "batch_id",
                             "chunk_index",
+                            "chunk_in_chapter",
+                            "chapter_index",
+                            "chapter_title",
                             "doc_name",
                             "_source_db",
                         ],
@@ -1036,11 +1074,15 @@ class BM25Engine {
                 storeFields: [
                     "id",
                     "text",
+                    "context",
                     "tags",
                     "timestamp",
                     "index",
                     "batch_id",
                     "chunk_index",
+                    "chunk_in_chapter",
+                    "chapter_index",
+                    "chapter_title",
                     "doc_name",
                     "_source_db",
                 ],

@@ -409,8 +409,42 @@ function processEchoLogic(
     return { echoItems, nextMemories, echoLogs };
 }
 
-// 辅助：获取向量
+// 🛡️ 向量接口超时与重试（硅基等网关响应抖动很大，实测有 19s 的慢请求）
+const EMBED_TIMEOUT_MS =
+    Number(process.env.ANIMA_EMBED_TIMEOUT_MS) > 0
+        ? Number(process.env.ANIMA_EMBED_TIMEOUT_MS)
+        : 60000;
+const EMBED_MAX_ATTEMPTS = 3;
+
+function isRetriableEmbedError(e) {
+    if (!e) return false;
+    if (e.name === "AbortError") return true;
+    return /超时|timeout|fetch failed|socket|ECONN|ETIMEDOUT|ECONNRESET|5\d\d/i.test(
+        String(e.message || ""),
+    );
+}
+
+// 辅助：获取向量（带超时 + 重试）
 async function getEmbedding(text, config) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= EMBED_MAX_ATTEMPTS; attempt++) {
+        try {
+            return await getEmbeddingOnce(text, config);
+        } catch (e) {
+            lastErr = e;
+            if (!isRetriableEmbedError(e) || attempt === EMBED_MAX_ATTEMPTS) throw e;
+            const wait = 1500 * attempt;
+            console.warn(
+                `[Anima RAG] ⚠️ 向量化失败(第 ${attempt}/${EMBED_MAX_ATTEMPTS} 次): ${e.message} —— ${wait}ms 后重试`,
+            );
+            await new Promise((r) => setTimeout(r, wait));
+        }
+    }
+    throw lastErr;
+}
+
+// 原函数体（单次请求）
+async function getEmbeddingOnce(text, config) {
     if (!config || !config.key) throw new Error("API Key missing");
     try {
         const fetchUrl = `${config.url.replace(/\/+$/, "")}/embeddings`;
@@ -421,7 +455,7 @@ async function getEmbedding(text, config) {
 
         // 🟢 新增：15秒硬性超时控制 (防止 Node.js 原生 fetch 无限挂起)
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000);
+        const timeoutId = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
 
         const response = await fetch(fetchUrl, {
             method: "POST",

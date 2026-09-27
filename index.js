@@ -4284,6 +4284,56 @@ async function init(router) {
         }
     });
 
+    // ==========================================
+    // 🟢 新增：删除整本书（向量库 + BM25 库 一起删）
+    // ==========================================
+    router.post("/delete_book", async (req, res) => {
+        const { collectionId } = req.body;
+        if (
+            !collectionId ||
+            collectionId.trim() === "" ||
+            collectionId.includes("..") ||
+            collectionId.includes("/") ||
+            collectionId.includes("\\")
+        ) {
+            return res.status(400).send("Invalid or unsafe collectionId");
+        }
+        try {
+            const safeName = toSafeName(collectionId);
+            if (activeIndexes.has(safeName)) activeIndexes.delete(safeName);
+            if (writeQueues.has(safeName)) writeQueues.delete(safeName);
+            invalidateOutline(safeName);
+
+            // 1) 向量库
+            let vectorDeleted = false;
+            const collectionPath = path.join(VECTOR_ROOT, safeName);
+            if (fs.existsSync(collectionPath)) {
+                fs.rmSync(collectionPath, { recursive: true, force: true });
+                vectorDeleted = true;
+            }
+
+            // 2) BM25 库（同时清内存缓存 + 删文件）
+            let bm25Deleted = false;
+            try {
+                const bm25Path = path.join(BM25_ROOT, `${safeName}.json`);
+                if (fs.existsSync(bm25Path)) {
+                    await bm25Engine.deleteIndex(safeName);
+                    bm25Deleted = true;
+                }
+            } catch (e) {
+                console.warn(`[Anima RAG] 删除 BM25 失败: ${e.message}`);
+            }
+
+            console.log(
+                `[Anima RAG] 🗑️ 整本书已删除: ${collectionId} | 向量:${vectorDeleted} BM25:${bm25Deleted}`,
+            );
+            res.json({ success: true, vectorDeleted, bm25Deleted });
+        } catch (err) {
+            console.error(`[Anima RAG] Delete Book Error: ${err.message}`);
+            res.status(500).send(err.message);
+        }
+    });
+
     router.post("/delete_batch", async (req, res) => {
         const { collectionId, batch_id } = req.body;
 
